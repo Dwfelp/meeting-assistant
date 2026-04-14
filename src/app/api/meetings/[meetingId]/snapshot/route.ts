@@ -19,7 +19,7 @@ export async function GET(
         transcript: [],
         participants: [],
         actions: [],
-        summary: { topics: [], decisions: [], nextActions: [], risks: [], updatedAt: new Date().toISOString() },
+        summary: { topics: [], briefPoints: [], decisions: [], nextActions: [], risks: [], updatedAt: new Date().toISOString() },
         sentiments: [],
         createdAt: new Date().toISOString(),
         title: '新会议'

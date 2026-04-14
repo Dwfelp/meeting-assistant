@@ -9,11 +9,20 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { Meeting } from "@/types/meeting";
-import { Activity, CheckCircle2, Languages, Mic, Sparkles, Users } from "lucide-react";
+import { Meeting, Participant } from "@/types/meeting";
+import { Activity, CheckCircle2, Languages, Loader2, Mic, Sparkles, Users } from "lucide-react";
 import { VoiceAssistant } from "@/components/voice-assistant";
 import { generateSummaryWithLlm } from "@/lib/llm-client";
-import { inferDueDate } from "@/lib/analysis";
+import {
+  dedupeSimilarStrings,
+  mergeMeetingSummaries,
+  normalizeActionDueDate,
+  normalizeActionOwner,
+  stripSummaryListOrdinalPrefix,
+} from "@/lib/analysis";
+
+const ACTION_HINT_RE =
+  /(明天|今天|今晚|后天|周[一二三四五六日天]|下周|本周|月底|before|by|tomorrow|tonight|next week|deadline|due|需要|负责|完成|提交|汇报|准备|please|need to|should|will)/i;
 
 async function createMeeting(title: string) {
   const res = await fetch("/api/meetings", {
@@ -54,11 +63,25 @@ async function translateText(text: string, targetLang: string = 'zh'): Promise<s
   }
 }
 
-async function postSegment(meetingId: string, speakerName: string, text: string, language: string, translatedText?: string) {
+async function postSegment(
+  meetingId: string,
+  speakerName: string,
+  text: string,
+  language: string,
+  translatedText?: string,
+  preferChineseSummary?: boolean,
+) {
   const res = await fetch(`/api/meetings/${meetingId}/events`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ speakerName, text, language, isFinal: true, translatedText }),
+    body: JSON.stringify({
+      speakerName,
+      text,
+      language,
+      isFinal: true,
+      translatedText,
+      preferChineseSummary: Boolean(preferChineseSummary),
+    }),
   });
 
   if (!res.ok) {
@@ -83,8 +106,56 @@ async function fetchSnapshot(meetingId: string) {
   return data.meeting;
 }
 
+/** events API 只同步转录；保留客户端已合并的摘要与行动项，避免被空数组覆盖 */
+function mergeParticipantsFromServer(prev: Participant[], serverRaw: unknown): Participant[] {
+  if (!Array.isArray(serverRaw) || serverRaw.length === 0) return prev;
+  if (typeof serverRaw[0] === "string") {
+    const names = serverRaw as string[];
+    const byName = new Map(prev.map((p) => [p.name, p]));
+    for (const n of names) {
+      const name = String(n).trim();
+      if (!name) continue;
+      if (!byName.has(name)) {
+        byName.set(name, {
+          id: name.toLowerCase().replace(/\s+/g, "-"),
+          name,
+        });
+      }
+    }
+    return Array.from(byName.values());
+  }
+  return serverRaw as Participant[];
+}
+
+function mergeServerMeetingIntoLocal(prev: Meeting | null, server: Meeting): Meeting {
+  if (!prev) return server;
+  return {
+    ...prev,
+    transcript: server.transcript,
+    id: server.id,
+    title: server.title?.trim() ? server.title : prev.title,
+    createdAt: server.createdAt ?? prev.createdAt,
+    participants: mergeParticipantsFromServer(prev.participants, server.participants as unknown),
+    actions: prev.actions,
+    summary: prev.summary,
+    sentiments: prev.sentiments,
+  };
+}
+
+function InsightSectionTitle({ title, loading }: { title: string; loading: boolean }) {
+  return (
+    <div className="mb-2 flex shrink-0 items-center justify-between gap-2">
+      <h3 className="text-sm font-semibold">{title}</h3>
+      {loading ? (
+        <Loader2 className="size-4 shrink-0 animate-spin text-muted-foreground" aria-label="加载中" />
+      ) : null}
+    </div>
+  );
+}
+
 export function MeetingDashboard() {
   const initialTitleRef = useRef("产品周会 - 智能助手演示");
+  const meetingRef = useRef<Meeting | null>(null);
   const [meeting, setMeeting] = useState<Meeting | null>(null);
   const [meetingTitle, setMeetingTitle] = useState(initialTitleRef.current);
   const [speakerName, setSpeakerName] = useState("Alice");
@@ -96,10 +167,53 @@ export function MeetingDashboard() {
   const [interimText, setInterimText] = useState("");
   const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
   const [enableTranslation, setEnableTranslation] = useState(true); // ✅ 新增：翻译开关
+  const enableTranslationRef = useRef(enableTranslation);
+  const lastLlmCallTimeRef = useRef<number>(0);
+  const LLM_INTERVAL_MS = 40_000;
 
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  useEffect(() => {
+    meetingRef.current = meeting;
+  }, [meeting]);
+
+  useEffect(() => {
+    enableTranslationRef.current = enableTranslation;
+  }, [enableTranslation]);
+
+  const displayTopics = useMemo(
+    () =>
+      dedupeSimilarStrings(
+        (meeting?.summary.topics ?? []).map((t) => t.trim()).filter(Boolean),
+        "topic",
+      ).slice(0, 6),
+    [meeting?.summary.topics],
+  );
+
+  const displayBriefPoints = useMemo(
+    () =>
+      dedupeSimilarStrings(
+        (meeting?.summary.briefPoints ?? []).map((b) => stripSummaryListOrdinalPrefix(b)).filter(Boolean),
+        "sentence",
+      ).slice(0, 6),
+    [meeting?.summary.briefPoints],
+  );
+
+  const displayRisks = useMemo(
+    () =>
+      dedupeSimilarStrings(
+        (meeting?.summary.risks ?? []).map((r) => stripSummaryListOrdinalPrefix(r)).filter(Boolean),
+        "sentence",
+      ).slice(0, 4),
+    [meeting?.summary.risks],
+  );
+
+  const displayActions = useMemo(
+    () => meeting?.actions ?? [],
+    [meeting?.actions],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -123,16 +237,6 @@ export function MeetingDashboard() {
     };
   }, []);
 
-  const sentimentOverview = useMemo(() => {
-    const sentiments = meeting?.sentiments ?? [];
-    if (!sentiments.length) {
-      return "暂无显著情绪波动";
-    }
-
-    const latest = sentiments[sentiments.length - 1];
-    return `最近信号：${latest.label}（强度 ${latest.intensity.toFixed(2)}）`;
-  }, [meeting?.sentiments]);
-
   async function handleSubmitSegment() {
     if (!meeting?.id || !text.trim()) return;
 
@@ -146,15 +250,39 @@ export function MeetingDashboard() {
         translatedText = translation || '';
       }
       
-      const updatedMeeting = await postSegment(meeting.id, speakerName, text.trim(), language, translatedText);
-      setMeeting(updatedMeeting);
+      const updatedMeeting = await postSegment(
+        meeting.id,
+        speakerName,
+        text.trim(),
+        language,
+        translatedText,
+        enableTranslation,
+      );
+      const merged = mergeServerMeetingIntoLocal(meeting, updatedMeeting);
+      setMeeting(merged);
       setText("");
 
-      const transcriptTexts = updatedMeeting.transcript.map(
+      const transcriptTexts = merged.transcript.map(
         seg => `${seg.speakerName}: ${seg.text}`
       );
-      const hasServerSummary = updatedMeeting.summary?.topics?.length || updatedMeeting.summary?.decisions?.length || updatedMeeting.summary?.nextActions?.length || updatedMeeting.summary?.risks?.length;
-      if (!hasServerSummary) {
+      const latestText = merged.transcript[merged.transcript.length - 1]?.text ?? "";
+      const now = Date.now();
+      const timeSinceLastCall = now - lastLlmCallTimeRef.current;
+      const hasServerSummary =
+        (merged.summary?.summaryText?.trim()?.length ?? 0) > 0 ||
+        (merged.summary?.briefPoints?.length ?? 0) > 0 ||
+        merged.summary?.topics?.length ||
+        merged.summary?.decisions?.length ||
+        merged.summary?.nextActions?.length ||
+        merged.summary?.risks?.length;
+      const shouldFastRefresh = ACTION_HINT_RE.test(latestText) && timeSinceLastCall >= 6_000;
+      
+      // 三路触发：无摘要 / 周期刷新 / 明显待办语句快速刷新
+      if (
+        transcriptTexts.length > 0 &&
+        (!hasServerSummary || timeSinceLastCall >= LLM_INTERVAL_MS || shouldFastRefresh)
+      ) {
+        lastLlmCallTimeRef.current = now;
         await generateAndUpdateSummary(transcriptTexts);
       }
     } catch (e) {
@@ -164,7 +292,7 @@ export function MeetingDashboard() {
     }
   }
 
-  // 生成并更新摘要的函数
+  // 生成并更新摘要的函数（从转录参考提取）
   const generateAndUpdateSummary = async (transcriptTexts: string[]) => {
     if (isGeneratingSummary) return;
     
@@ -175,51 +303,68 @@ export function MeetingDashboard() {
     
     setIsGeneratingSummary(true);
     
-    console.log('[LLM] 开始生成摘要，共', transcriptTexts.length, '条');
+    console.log('[LLM] 开始生成摘要（从转录参考），共', transcriptTexts.length, '条');
     
     try {
+      const prevSnap = meetingRef.current;
       const result = await generateSummaryWithLlm({
         transcriptWindow: transcriptTexts,
-        previousSummary: meeting?.summary ? JSON.stringify(meeting.summary) : undefined
+        previousSummary: prevSnap
+          ? JSON.stringify({
+              ...prevSnap.summary,
+              preservedActionItems: prevSnap.actions.map((a) => ({
+                description: a.description,
+                owner: a.owner,
+                due: a.dueDate,
+              })),
+            })
+          : undefined,
+        preferChineseOutput: enableTranslationRef.current,
       });
       
       if (result) {
         console.log('[LLM] 生成成功:', result);
         
-        setMeeting(prev => {
+        setMeeting((prev) => {
           if (!prev) return prev;
-          
-          const newActions = (result.nextActions || []).map((action, index) => ({
-              id: `action_${Date.now()}_${index}_${Math.random()}`,
+
+          const fromStructured = (result.actionItems ?? [])
+            .filter(
+              (item) => item.description?.trim(),
+            )
+            .map((item, index) => ({
+              id: `action_${Date.now()}_s${index}_${Math.random()}`,
               meetingId: prev.id,
-              sourceSegmentId: '',
-              description: action,
-              owner: null,
-              dueDate: inferDueDate(action),
-              status: 'pending_confirmation' as const,
-              confidence: 0.8
+              sourceSegmentId: "",
+              description: item.description.trim(),
+              owner: normalizeActionOwner(item.owner, item.description),
+              dueDate: normalizeActionDueDate(item.due, item.description),
+              status: "pending_confirmation" as const,
             }));
-          
-          const existingDescriptions = new Set(prev.actions.map(a => a.description));
-          const uniqueNewActions = newActions.filter(a => !existingDescriptions.has(a.description));
-          const allActions = [...prev.actions, ...uniqueNewActions];
-          
+
+          const newActions = [...fromStructured];
+          const mergedSummary = mergeMeetingSummaries(prev.summary, {
+            summaryText: result.summaryText,
+            topics: result.topics || [],
+            briefPoints: result.briefPoints || [],
+            decisions: result.decisions || [],
+            nextActions: result.nextActions || [],
+            risks: result.risks || [],
+            updatedAt: new Date().toISOString(),
+          });
+          const mergedActions = newActions.length > 0 ? newActions : prev.actions;
+
           return {
             ...prev,
-            summary: {
-              summaryText: result.summaryText,
-              topics: result.topics || [],
-              decisions: result.decisions || [],
-              nextActions: result.nextActions || [],
-              risks: result.risks || [],
-              updatedAt: new Date().toISOString()
-            },
-            actions: allActions
+            summary: mergedSummary,
+            actions: mergedActions,
           };
         });
+      } else {
       }
     } catch (error) {
       console.error('[LLM] 生成失败:', error);
+      setError(`摘要生成失败，请检查网络或稍后重试: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setIsGeneratingSummary(false);
     }
@@ -291,14 +436,36 @@ export function MeetingDashboard() {
     
     try {
       // 保存到后端（带上译文）
-      const updatedMeeting = await postSegment(currentMeeting.id, speakerName, text, language, translatedText);
+      const updatedMeeting = await postSegment(
+        currentMeeting.id,
+        speakerName,
+        text,
+        language,
+        translatedText,
+        enableTranslationRef.current,
+      );
       console.log('[UI] 后端保存成功', updatedMeeting);
-      setMeeting(updatedMeeting);
+      const mergedVoice = mergeServerMeetingIntoLocal(meetingRef.current ?? currentMeeting, updatedMeeting);
+      setMeeting(mergedVoice);
 
-      const transcriptTexts = updatedMeeting.transcript.map(seg => `${seg.speakerName}: ${seg.text}`);
-      const hasServerSummary = updatedMeeting.summary?.topics?.length || updatedMeeting.summary?.decisions?.length || updatedMeeting.summary?.nextActions?.length || updatedMeeting.summary?.risks?.length;
+      const transcriptTexts = mergedVoice.transcript.map(seg => `${seg.speakerName}: ${seg.text}`);
+      const latestText = mergedVoice.transcript[mergedVoice.transcript.length - 1]?.text ?? "";
+      const now = Date.now();
+      const timeSinceLastCall = now - lastLlmCallTimeRef.current;
+      const hasServerSummary =
+        (mergedVoice.summary?.summaryText?.trim()?.length ?? 0) > 0 ||
+        (mergedVoice.summary?.briefPoints?.length ?? 0) > 0 ||
+        mergedVoice.summary?.topics?.length ||
+        mergedVoice.summary?.decisions?.length ||
+        mergedVoice.summary?.nextActions?.length ||
+        mergedVoice.summary?.risks?.length;
+      const shouldFastRefresh = ACTION_HINT_RE.test(latestText) && timeSinceLastCall >= 6_000;
 
-      if (!hasServerSummary) {
+      if (
+        transcriptTexts.length > 0 &&
+        (!hasServerSummary || timeSinceLastCall >= LLM_INTERVAL_MS || shouldFastRefresh)
+      ) {
+        lastLlmCallTimeRef.current = now;
         await generateAndUpdateSummary(transcriptTexts);
       }
     } catch (e) {
@@ -427,11 +594,7 @@ export function MeetingDashboard() {
               </div>
               <div className="flex items-center justify-between rounded-lg border p-3">
                 <span className="text-muted-foreground">行动项</span>
-                <span className="font-medium">{meeting?.actions.length ?? 0}</span>
-              </div>
-              <div className="rounded-lg border p-3">
-                <p className="mb-1 text-muted-foreground">情绪概览</p>
-                <p className="font-medium">{sentimentOverview}</p>
+                <span className="font-medium">{displayActions.length}</span>
               </div>
             </CardContent>
           </Card>
@@ -487,78 +650,112 @@ export function MeetingDashboard() {
                 </ScrollArea>
               </TabsContent>
 
-              <TabsContent value="summary" className="mt-4 grid gap-4 md:grid-cols-2">
-                {/* ✅ 新增：一段话总结显示 */}
-                {meeting?.summary.summaryText && (
-                  <div className="rounded-lg border p-3 md:col-span-2 bg-sky-50">
-                    <h3 className="mb-2 text-sm font-semibold">会议摘要</h3>
-                    <p className="text-sm">{meeting.summary.summaryText}</p>
+              <TabsContent value="summary" className="mt-4">
+                <div className="flex h-[min(40rem,calc(100dvh-13rem))] min-h-[36rem] flex-col gap-3 rounded-lg border p-3">
+                  <section className="flex min-h-0 w-full shrink-0 basis-[30%] flex-col overflow-hidden rounded-lg border bg-muted/20 p-3">
+                    <InsightSectionTitle title="会议摘要" loading={isGeneratingSummary} />
+                    <ScrollArea className="min-h-0 w-full flex-1">
+                      <div className="pr-3 text-sm leading-7">
+                        {meeting?.summary.summaryText?.trim() ? (
+                          <p className="leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">
+                            {meeting.summary.summaryText}
+                          </p>
+                        ) : (
+                          <p className="text-muted-foreground">
+                            {isGeneratingSummary
+                              ? "正在生成摘要…"
+                              : "暂无摘要。提交发言或语音转写后，将在后台生成并显示在此处。"}
+                          </p>
+                        )}
+                      </div>
+                    </ScrollArea>
+                  </section>
+                  <div className="flex min-h-0 flex-1 gap-3 overflow-hidden md:flex-row flex-col">
+                    <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border bg-muted/20 p-3">
+                      <InsightSectionTitle title="关键主题" loading={isGeneratingSummary} />
+                      <ScrollArea className="min-h-0 w-full flex-1">
+                        <div className="flex flex-wrap gap-2 pr-3">
+                          {displayTopics.map((topic, idx) => (
+                            <Badge key={`topic-${idx}-${topic.slice(0, 24)}`} variant="secondary">{topic}</Badge>
+                          ))}
+                          {displayTopics.length === 0 && (
+                            <span className="text-sm text-muted-foreground">
+                              {isGeneratingSummary ? "正在生成主题…" : "暂无主题"}
+                            </span>
+                          )}
+                        </div>
+                      </ScrollArea>
+                    </section>
+                    <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border bg-muted/20 p-3">
+                      <InsightSectionTitle title="决策与后续" loading={isGeneratingSummary} />
+                      <ScrollArea className="min-h-0 w-full flex-1">
+                        <div className="pr-3 text-sm leading-7">
+                          {displayBriefPoints.length > 0 ? (
+                            <ol className="m-0 list-none space-y-3 text-muted-foreground [overflow-wrap:anywhere]">
+                              {displayBriefPoints.map((item, idx) => (
+                                <li key={`bp-${idx}`} className="flex gap-2">
+                                  <span className="min-w-[1.75rem] shrink-0 tabular-nums text-right">
+                                    {idx + 1}.
+                                  </span>
+                                  <span className="min-w-0 flex-1 leading-relaxed">{item}</span>
+                                </li>
+                              ))}
+                            </ol>
+                          ) : (
+                            <p className="text-muted-foreground">
+                              {isGeneratingSummary ? "正在生成决策与后续…" : "暂无决策与后续。"}
+                            </p>
+                          )}
+                        </div>
+                      </ScrollArea>
+                    </section>
                   </div>
-                )}
-                <div className="rounded-lg border p-3">
-                  <h3 className="mb-2 text-sm font-semibold">关键主题</h3>
-                  <div className="flex flex-wrap gap-2">
-                    {(meeting?.summary.topics ?? []).map((topic) => (
-                      <Badge key={topic} variant="secondary">{topic}</Badge>
-                    ))}
-                    {meeting?.summary.topics?.length === 0 && !isGeneratingSummary && (
-                      <span className="text-sm text-muted-foreground">暂无主题</span>
-                    )}
-                  </div>
+                  <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border bg-muted/20 p-3">
+                    <InsightSectionTitle title="风险与挑战" loading={isGeneratingSummary} />
+                    <ScrollArea className="min-h-0 w-full flex-1">
+                      <ul className="space-y-3 pr-3 text-sm leading-7 text-muted-foreground [overflow-wrap:anywhere]">
+                        {displayRisks.map((item, idx) => (
+                          <li key={`r-${idx}`}>• {item}</li>
+                        ))}
+                        {displayRisks.length === 0 && (
+                          <li className="text-muted-foreground">
+                            {isGeneratingSummary ? "正在识别风险…" : "暂无识别到的风险"}
+                          </li>
+                        )}
+                      </ul>
+                    </ScrollArea>
+                  </section>
                 </div>
-                <div className="rounded-lg border p-3">
-                  <h3 className="mb-2 text-sm font-semibold">决策与后续</h3>
-                  <ul className="space-y-1 text-sm text-muted-foreground">
-                    {(meeting?.summary.decisions ?? []).map((item, idx) => (
-                      <li key={`d-${idx}`}>• {item}</li>
-                    ))}
-                    {(meeting?.summary.nextActions ?? []).map((item, idx) => (
-                      <li key={`n-${idx}`}>• {item}</li>
-                    ))}
-                    {meeting?.summary.decisions?.length === 0 && meeting?.summary.nextActions?.length === 0 && !isGeneratingSummary && (
-                      <li className="text-muted-foreground">暂无决策或行动项</li>
-                    )}
-                  </ul>
-                </div>
-                <div className="rounded-lg border p-3 md:col-span-2">
-                  <h3 className="mb-2 text-sm font-semibold">风险与挑战</h3>
-                  <ul className="space-y-1 text-sm text-muted-foreground">
-                    {(meeting?.summary.risks ?? []).map((item, idx) => (
-                      <li key={`r-${idx}`}>• {item}</li>
-                    ))}
-                    {meeting?.summary.risks?.length === 0 && !isGeneratingSummary && (
-                      <li className="text-muted-foreground">暂无识别到的风险</li>
-                    )}
-                  </ul>
-                </div>
-                {isGeneratingSummary && (
-                  <div className="col-span-2 text-center text-sm text-muted-foreground py-4">
-                    正在生成摘要...
-                  </div>
-                )}
               </TabsContent>
 
               <TabsContent value="actions" className="mt-4">
                 <div className="rounded-lg border p-3">
-                  <div className="space-y-3">
-                    {(meeting?.actions ?? []).map((a) => (
-                      <div key={a.id} className="rounded-lg border bg-muted/30 p-3">
-                        <p className="text-sm font-medium">{a.description}</p>
-                        <Separator className="my-2" />
-                        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                          <Badge variant="outline">Owner: {a.owner ?? "待确认"}</Badge>
-                          <Badge variant="outline">Due: {a.dueDate ?? "未识别"}</Badge>
-                          <Badge variant="outline">Confidence: {a.confidence.toFixed(2)}</Badge>
+                  <InsightSectionTitle title="行动项" loading={isGeneratingSummary} />
+                  <ScrollArea className="h-[min(40rem,calc(100dvh-13rem))] min-h-[36rem] w-full">
+                    <div className="space-y-3 pr-3">
+                      {displayActions.map((a) => (
+                        <div key={a.id} className="rounded-lg border bg-muted/20 p-3">
+                          <p className="text-sm font-medium [overflow-wrap:anywhere]">
+                            {a.description}
+                          </p>
+                          <Separator className="my-2" />
+                          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                            <Badge variant="outline">
+                              Due: {normalizeActionDueDate(a.dueDate, a.description) ?? "无明确时间"}
+                            </Badge>
+                            {a.owner ? (
+                              <Badge variant="outline">Owner: {a.owner}</Badge>
+                            ) : null}
+                          </div>
                         </div>
-                      </div>
-                    ))}
-                    {(meeting?.actions ?? []).length === 0 && !isGeneratingSummary && (
-                      <p className="text-sm text-muted-foreground">暂未识别到行动项。摘要中的行动项会显示在上方"摘要"标签页。</p>
-                    )}
-                    {isGeneratingSummary && (
-                      <p className="text-sm text-muted-foreground">正在生成摘要和行动项...</p>
-                    )}
-                  </div>
+                      ))}
+                      {displayActions.length === 0 && (
+                        <p className="text-sm text-muted-foreground">
+                          {isGeneratingSummary ? "正在识别行动项…" : "暂未识别到行动项。"}
+                        </p>
+                      )}
+                    </div>
+                  </ScrollArea>
                 </div>
               </TabsContent>
 
@@ -570,8 +767,9 @@ export function MeetingDashboard() {
                       自动翻译 {meeting?.transcript.filter(seg => seg.translatedText).length || 0} 条
                     </Badge>
                   </div>
-                  <div className="space-y-3 max-h-96 overflow-auto">
-                    {(meeting?.transcript ?? []).slice().reverse().map((seg) => (
+                  <ScrollArea className="h-[min(40rem,calc(100dvh-13rem))] min-h-[36rem] w-full">
+                    <div className="space-y-3 pr-3">
+                      {(meeting?.transcript ?? []).slice().reverse().map((seg) => (
                       <div key={`trans-${seg.id}`} className="rounded-lg border bg-muted/20 p-3">
                         <div className="mb-2">
                           <span className="text-xs font-medium text-muted-foreground">原文</span>
@@ -594,13 +792,14 @@ export function MeetingDashboard() {
                           </p>
                         </div>
                       </div>
-                    ))}
-                    {meeting?.transcript.length === 0 && (
-                      <p className="text-center text-sm text-muted-foreground py-8">
-                        暂无内容，发送消息后会显示原文和译文
-                      </p>
-                    )}
-                  </div>
+                      ))}
+                      {meeting?.transcript.length === 0 && (
+                        <p className="text-center text-sm text-muted-foreground py-8">
+                          暂无内容，发送消息后会显示原文和译文
+                        </p>
+                      )}
+                    </div>
+                  </ScrollArea>
                 </div>
               </TabsContent>
             </Tabs>

@@ -1,10 +1,13 @@
 export interface LlmSummaryInput {
   transcriptWindow: string[];
   previousSummary?: string;
+  /** 开启「英译中」时为 true：摘要与行动项强制中文；否则跟随转写语言 */
+  preferChineseOutput?: boolean;
 }
 
 export interface LlmSummaryOutput {
   topics: string[];
+  briefPoints?: string[];
   decisions: string[];
   nextActions: string[];
   risks: string[];
@@ -43,7 +46,8 @@ export async function generateSummaryWithLlm(input: LlmSummaryInput): Promise<Ll
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         transcriptWindow: input.transcriptWindow,
-        previousSummary: input.previousSummary
+        previousSummary: input.previousSummary,
+        preferChineseOutput: Boolean(input.preferChineseOutput),
       })
     });
     
@@ -56,6 +60,7 @@ export async function generateSummaryWithLlm(input: LlmSummaryInput): Promise<Ll
     
     return {
       topics: data.topics || [],
+      briefPoints: data.briefPoints || [],
       decisions: data.decisions || [],
       nextActions: data.nextActions || [],
       risks: data.risks || [],

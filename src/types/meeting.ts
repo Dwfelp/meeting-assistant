@@ -26,7 +26,6 @@ export interface ActionItem {
   owner: string | null;
   dueDate: string | null;
   sourceSegmentId: string;
-  confidence: number;
   status: "pending_confirmation" | "confirmed" | "done";
 }
 
@@ -41,8 +40,10 @@ export interface SentimentMoment {
 }
 
 export interface MeetingSummary {
-  summaryText?: string; 
+  summaryText?: string;
   topics: string[];
+  /** 结构化小结（每条 1～2 句），与行动项 tab 区分，不写待办清单体 */
+  briefPoints?: string[];
   decisions: string[];
   risks: string[];
   nextActions: string[];
@@ -65,5 +66,7 @@ export interface IngestEventInput {
   text: string;
   language?: string;
   isFinal?: boolean;
-  translatedText?: string; 
+  translatedText?: string;
+  /** 与 UI「启用自动翻译」一致：为 true 时摘要/行动项输出中文 */
+  preferChineseSummary?: boolean;
 }

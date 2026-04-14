@@ -1,8 +1,32 @@
-import { detectSentiment, extractActionItems, updateSummaryWithLlmOrFallback } from "@/lib/analysis";
+import {
+  detectSentiment,
+  extractActionItems,
+  normalizeActionDueDate,
+  normalizeActionOwner,
+  updateSummary,
+  updateSummaryWithLlmOrFallback,
+} from "@/lib/analysis";
 import { IngestEventInput, Meeting, TranscriptSegment } from "@/types/meeting";
 
 const meetings = new Map<string, Meeting>();
 const llmLastRunAtMsByMeeting = new Map<string, number>();
+
+/** 已有摘要后 LLM 全量刷新最小间隔（避免每条发言都打模型） */
+const LLM_SUMMARY_INTERVAL_MS = 90_000;
+/** 会议尚无像样摘要时，稍短间隔便于冷启动 */
+const LLM_SUMMARY_BOOTSTRAP_INTERVAL_MS = 30_000;
+
+function meetingHasUsableSummary(meeting: Meeting): boolean {
+  const s = meeting.summary;
+  return Boolean(
+    s.summaryText?.trim() ||
+      (s.briefPoints?.length ?? 0) > 0 ||
+      (s.topics?.length ?? 0) > 0 ||
+      (s.decisions?.length ?? 0) > 0 ||
+      (s.nextActions?.length ?? 0) > 0 ||
+      (s.risks?.length ?? 0) > 0,
+  );
+}
 
 function createEmptyMeeting(id: string, title: string): Meeting {
   const now = new Date().toISOString();
@@ -17,6 +41,7 @@ function createEmptyMeeting(id: string, title: string): Meeting {
     summary: {
       summaryText: '',
       topics: [],
+      briefPoints: [],
       decisions: [],
       risks: [],
       nextActions: [],
@@ -71,7 +96,7 @@ export async function ingestTranscriptEvent(meetingId: string, input: IngestEven
   // 规则匹配提取行动项（作为兜底）
   const ruleBasedActionItems = extractActionItems(segment);
   if (ruleBasedActionItems.length) {
-    meeting.actions.push(...ruleBasedActionItems);
+    meeting.actions = [...meeting.actions, ...ruleBasedActionItems];
   }
 
   // 情感分析
@@ -81,44 +106,38 @@ export async function ingestTranscriptEvent(meetingId: string, input: IngestEven
   }
 
   const lastRun = llmLastRunAtMsByMeeting.get(meetingId) ?? 0;
-  const shouldRunLlm = now - lastRun >= 3500;
+  const intervalMs = meetingHasUsableSummary(meeting)
+    ? LLM_SUMMARY_INTERVAL_MS
+    : LLM_SUMMARY_BOOTSTRAP_INTERVAL_MS;
+  const shouldRunLlm = now - lastRun >= intervalMs;
   const transcriptWindow = meeting.transcript;
 
   if (shouldRunLlm) {
     llmLastRunAtMsByMeeting.set(meetingId, now);
     try {
-      const { summary, actionItems } = await updateSummaryWithLlmOrFallback(meeting, transcriptWindow);
+      const { summary, actionItems } = await updateSummaryWithLlmOrFallback(meeting, transcriptWindow, {
+        preferChineseOutput: input.preferChineseSummary === true,
+      });
       meeting.summary = summary;
 
-      // 使用 LLM 返回的 actionItems（包含 owner）
       if (actionItems?.length) {
-        const existingDescriptions = new Set(meeting.actions.map(a => a.description));
-        const newActions = actionItems
-          .filter(item => item.description && !existingDescriptions.has(item.description))
-          .map((item) => ({
-            id: crypto.randomUUID(),
-            meetingId,
-            description: item.description,
-            owner: item.owner || null,
-            dueDate: item.due,
-            sourceSegmentId: segment.id,
-            confidence: 0.85,
-            status: "pending_confirmation" as const,
-          }));
-        
-        if (newActions.length) {
-          meeting.actions.push(...newActions);
-        }
+        const newActions = actionItems.map((item) => ({
+          id: crypto.randomUUID(),
+          meetingId,
+          description: item.description,
+          owner: normalizeActionOwner(item.owner, item.description),
+          dueDate: normalizeActionDueDate(item.due, item.description),
+          sourceSegmentId: segment.id,
+          status: "pending_confirmation" as const,
+        }));
+        meeting.actions = newActions;
       }
     } catch (error) {
-      console.error('[MeetingStore] LLM 调用失败，使用降级方案:', error);
-      const { summary } = await updateSummaryWithLlmOrFallback(meeting, transcriptWindow);
-      meeting.summary = summary;
+      console.error("[MeetingStore] LLM 调用失败，使用规则降级:", error);
+      meeting.summary = updateSummary(meeting, segment);
     }
   } else {
-    // 未达到调用频率，也尝试更新（但不调用 LLM，只做规则更新）
-    const { summary } = await updateSummaryWithLlmOrFallback(meeting, transcriptWindow);
-    meeting.summary = summary;
+    meeting.summary = updateSummary(meeting, segment);
   }
   
   return meeting;
